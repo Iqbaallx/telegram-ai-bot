@@ -5,9 +5,12 @@ import base64
 import io
 from io import BytesIO
 from PIL import Image
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
 import google.generativeai as genai
 import chess
 
@@ -54,6 +57,7 @@ Saya adalah *AI Assistant* berbasis Gemini 2.5 Flash 🚀
 • Generate gambar pakai `/image`
 • Ubah gambar jadi stiker otomatis 😎
 • Main catur pakai `/chess_start`
+• Kick/Ban anggota grup (khusus admin)
 
 📌 Perintah:
 /start - Mulai bot
@@ -61,8 +65,11 @@ Saya adalah *AI Assistant* berbasis Gemini 2.5 Flash 🚀
 /clear - Hapus riwayat
 /image <prompt> - Buat gambar
 /chess_start - Main catur
+/kick - Kick anggota (reply)
+/ban - Ban anggota (reply)
 """
     await update.message.reply_text(message, parse_mode="Markdown")
+
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("""
@@ -74,6 +81,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 3️⃣ Gunakan `/image <prompt>` untuk buat gambar  
 4️⃣ Kirim foto — otomatis jadi *stiker*!  
 5️⃣ Gunakan `/chess_start` untuk main catur  
+6️⃣ Gunakan `/kick` atau `/ban` untuk kelola grup (admin saja)
 
 ⚙️ Commands:
 /start - Mulai bot
@@ -83,10 +91,101 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /chess_start - Mulai catur
 """, parse_mode="Markdown")
 
+
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     conversation_history.pop(user_id, None)
     await update.message.reply_text("✅ Riwayat percakapan dihapus!")
+
+
+# ========================================
+# ADMIN TOOLS: KICK & BAN
+# ========================================
+
+async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    return member.status in ("administrator", "creator")
+
+
+async def _get_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message:
+        return update.message.reply_to_message.from_user.id
+    args = context.args
+    if args and args[0].isdigit():
+        return int(args[0])
+    return None
+
+
+async def _check_bot_permissions(chat_id, context):
+    me = await context.bot.get_me()
+    bot_member = await context.bot.get_chat_member(chat_id, me.id)
+    if bot_member.status != "administrator":
+        return False, "Bot bukan admin."
+    if not getattr(bot_member, "can_restrict_members", False):
+        return False, "Bot tidak punya izin untuk kick/ban."
+    return True, None
+
+
+async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if not await _is_admin(update, context):
+        await update.message.reply_text("❌ Kamu bukan admin, tidak bisa pakai perintah ini.")
+        return
+
+    ok, err = await _check_bot_permissions(chat_id, context)
+    if not ok:
+        await update.message.reply_text(f"❌ Tidak bisa kick: {err}")
+        return
+
+    target_id = await _get_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("Gunakan `/kick` sambil *reply* ke user yang mau dikick.", parse_mode="Markdown")
+        return
+
+    member = await context.bot.get_chat_member(chat_id, target_id)
+    if member.status in ("administrator", "creator"):
+        await update.message.reply_text("❌ Tidak bisa kick admin/owner grup.")
+        return
+
+    try:
+        await context.bot.ban_chat_member(chat_id, target_id)
+        await context.bot.unban_chat_member(chat_id, target_id)
+        await update.message.reply_text("✅ User berhasil dikick dari grup.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal kick: {e}")
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    if not await _is_admin(update, context):
+        await update.message.reply_text("❌ Kamu bukan admin, tidak bisa pakai perintah ini.")
+        return
+
+    ok, err = await _check_bot_permissions(chat_id, context)
+    if not ok:
+        await update.message.reply_text(f"❌ Tidak bisa ban: {err}")
+        return
+
+    target_id = await _get_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("Gunakan `/ban` sambil *reply* ke user yang mau diban.", parse_mode="Markdown")
+        return
+
+    member = await context.bot.get_chat_member(chat_id, target_id)
+    if member.status in ("administrator", "creator"):
+        await update.message.reply_text("❌ Tidak bisa ban admin/owner grup.")
+        return
+
+    try:
+        await context.bot.ban_chat_member(chat_id, target_id)
+        await update.message.reply_text("🚫 User telah dibanned dari grup.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Gagal ban: {e}")
+
 
 # ========================================
 # IMAGE GENERATION HANDLER
@@ -120,12 +219,12 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Terjadi error: {str(e)}")
         logger.error(traceback.format_exc())
 
+
 # ========================================
-# PHOTO TO STICKER HANDLER (AUTO)
+# PHOTO TO STICKER HANDLER
 # ========================================
 
 async def photo_to_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ubah gambar yang dikirim jadi stiker otomatis"""
     try:
         msg = await update.message.reply_text("🧩 Sedang ubah gambar jadi stiker...")
 
@@ -135,7 +234,7 @@ async def photo_to_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
         img_bytes.seek(0)
 
         image = Image.open(img_bytes).convert("RGBA")
-        image.thumbnail((512, 512))  # ukuran wajib stiker
+        image.thumbnail((512, 512))
 
         bio = BytesIO()
         image.save(bio, format="WEBP")
@@ -143,10 +242,10 @@ async def photo_to_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_sticker(sticker=InputFile(bio, filename="sticker.webp"))
         await msg.edit_text("✅ Gambar berhasil diubah jadi stiker!")
-
     except Exception as e:
         logger.error(traceback.format_exc())
         await update.message.reply_text(f"⚠️ Gagal ubah gambar ke stiker: {e}")
+
 
 # ========================================
 # CHESS HANDLERS
@@ -179,6 +278,7 @@ async def chess_move_command(update, context):
     else:
         await update.message.reply_text(f"Langkah `{move_str}` berhasil!\n```\n{board}\n```", parse_mode="Markdown")
 
+
 # ========================================
 # TEXT HANDLER (GEMINI)
 # ========================================
@@ -188,7 +288,6 @@ async def handle_message(update, context):
     text = update.message.text
     chat_type = update.message.chat.type
 
-    # Balasan hanya kalau disebut di grup
     if chat_type in ["group", "supergroup"]:
         bot_username = context.bot.username
         if f"@{bot_username}" not in text and not (
@@ -209,15 +308,14 @@ async def handle_message(update, context):
         model = genai.GenerativeModel(MODEL_TEXT)
         response = model.generate_content(contents=[{"role": "user", "parts": [context_text]}])
         reply = response.text or "⚠️ Tidak ada respon dari AI."
-
         conversation_history[user_id].append({"role": "assistant", "content": reply})
 
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i:i+4000])
-
     except Exception as e:
         logger.error(traceback.format_exc())
         await update.message.reply_text(f"⚠️ Error internal: {e}")
+
 
 # ========================================
 # MAIN
@@ -226,17 +324,23 @@ async def handle_message(update, context):
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(CommandHandler("image", image_command))
     app.add_handler(CommandHandler("chess_start", chess_start_command))
     app.add_handler(CommandHandler("move", chess_move_command))
+    app.add_handler(CommandHandler("kick", kick_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+
+    # Message handlers
     app.add_handler(MessageHandler(filters.PHOTO, photo_to_sticker))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("🤖 Bot aktif (Gemini 2.5 Flash + Gambar + Stiker + Catur)")
+    logger.info("🤖 Bot aktif (Gemini 2.5 Flash + Gambar + Stiker + Catur + Admin Tools)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
