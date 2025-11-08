@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import google.generativeai as genai
+import chess  # <-- Ditambahkan untuk catur
 
 # ========================================
 # LOAD ENV & LOGGING SETUP
@@ -40,6 +41,7 @@ MODEL_TEXT = "gemini-2.5-flash"
 MODEL_IMAGE = "gemini-2.5-flash-exp"
 
 conversation_history = {}
+chess_games = {}  # <-- Ditambahkan untuk menyimpan status game catur per chat
 
 # ========================================
 # COMMAND HANDLERS
@@ -63,7 +65,8 @@ Saya adalah *AI Assistant* berbasis Gemini 2.5 Flash 🚀
 /help - Bantuan
 /clear - Hapus riwayat chat
 /mode - Ganti mode AI
-/image <prompt> - Buat gambar dari deskripsi
+/image <prompt> - Buat gambar
+/chess_start - Mulai main catur
 """
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -77,6 +80,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 2️⃣ Gunakan /clear untuk reset percakapan  
 3️⃣ Tag bot di grup: `@bot_username pesan`
 4️⃣ Gunakan `/image <prompt>` untuk buat gambar
+5️⃣ Gunakan `/chess_start` untuk main catur
 
 ⚙️ Commands:
 /start - Mulai bot
@@ -84,6 +88,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /clear - Hapus chat
 /mode - Ganti mode
 /image - Buat gambar
+/chess_start - Mulai catur
+/chess_stop - Hentikan catur
+/move <langkah> - Langkah catur
 """
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -154,6 +161,98 @@ async def text_fallback_image(update, prompt):
         await update.message.reply_text(f"📝 Deskripsi (fallback):\n{response.text}")
     except Exception as e:
         await update.message.reply_text(f"❌ Gagal melakukan fallback: {str(e)}")
+
+# ========================================
+# CHESS GAME HANDLERS (FITUR BARU)
+# ========================================
+
+async def chess_start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Memulai permainan catur baru."""
+    chat_id = update.effective_chat.id
+    if chat_id in chess_games:
+        await update.message.reply_text(
+            "⚠️ Permainan catur sudah berjalan di chat ini.\n"
+            "Gunakan /move <langkah> untuk bermain atau /chess_stop untuk berhenti."
+        )
+        return
+
+    chess_games[chat_id] = chess.Board()
+    board = chess_games[chat_id]
+    board_str = f"```\n{board}\n```"  # Papan catur versi teks ASCII
+
+    await update.message.reply_text(
+        f"♟️ *Permainan Catur Dimulai!* ♟️\n\n{board_str}\n\n"
+        "Giliran: *Putih*.\n"
+        "Gunakan /move <langkah> (misal: `/move e4` atau `/move Nf3`).\n"
+        "Gunakan /chess_stop untuk mengakhiri game.",
+        parse_mode="Markdown"
+    )
+
+async def chess_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menghentikan permainan catur yang sedang berjalan."""
+    chat_id = update.effective_chat.id
+    if chat_id in chess_games:
+        del chess_games[chat_id]
+        await update.message.reply_text("✅ Permainan catur telah dihentikan.")
+    else:
+        await update.message.reply_text("ℹ️ Tidak ada permainan catur yang sedang berjalan.")
+
+async def chess_move_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Memproses langkah catur."""
+    chat_id = update.effective_chat.id
+    if chat_id not in chess_games:
+        await update.message.reply_text("ℹ️ Tidak ada permainan catur yang berjalan. Mulai dengan /chess_start.")
+        return
+
+    board = chess_games[chat_id]
+    move_str = " ".join(context.args)
+
+    if not move_str:
+        await update.message.reply_text("Gunakan format: `/move <langkah>` (misal: `/move e4`)")
+        return
+
+    try:
+        # Mencoba mem-parsing langkah (misal: "e4", "Nf3", "e8=Q")
+        board.push_san(move_str)
+    except (chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError, ValueError) as e:
+        # Jika gagal, coba parsing sebagai UCI (misal: "e2e4", "e7e8q")
+        try:
+            board.push_uci(move_str)
+        except (chess.IllegalMoveError, chess.InvalidMoveError, ValueError):
+            await update.message.reply_text(f"❌ Langkah tidak valid: `{move_str}`\n{e}", parse_mode="Markdown")
+            return
+
+    # Buat string papan catur versi baru
+    board_str = f"```\n{board}\n```"
+    giliran = "Putih" if board.turn == chess.WHITE else "Hitam"
+
+    # Cek apakah game selesai
+    if board.is_game_over():
+        result = "Game Selesai!"
+        if board.is_checkmate():
+            result = f"♟️ *SKAKMAT!* Pemenangnya adalah {'Putih' if board.turn == chess.BLACK else 'Hitam'}."
+        elif board.is_stalemate():
+            result = "♟️ *STALEMATE!* Hasil seri."
+        elif board.is_insufficient_material():
+            result = "♟️ *SERI!* Materi tidak cukup."
+        else:
+            result = f"♟️ *SERI!* ({board.result()})"
+
+        await update.message.reply_text(
+            f"Langkah: `{move_str}`\n\n{board_str}\n\n"
+            f"🎉 *{result}*",
+            parse_mode="Markdown"
+        )
+        del chess_games[chat_id]  # Hapus game dari memori
+
+    else:
+        # Jika game belum selesai
+        status = "Skak!" if board.is_check() else ""
+        await update.message.reply_text(
+            f"Langkah: `{move_str}`\n\n{board_str}\n\n"
+            f"Giliran: *{giliran}*. {status}",
+            parse_mode="Markdown"
+        )
 
 # ========================================
 # MESSAGE HANDLER
@@ -239,11 +338,18 @@ def main():
     application.add_handler(CommandHandler("clear", clear_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("image", image_command))
+    
+    # --- Handler Catur (BARU) ---
+    application.add_handler(CommandHandler("chess_start", chess_start_command))
+    application.add_handler(CommandHandler("chess_stop", chess_stop_command))
+    application.add_handler(CommandHandler("move", chess_move_command))
+    # --- Akhir Handler Catur ---
+
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     application.add_error_handler(lambda update, context: logger.error(f"Update {update} caused error {context.error}"))
 
-    logger.info("🤖 Bot started successfully (Gemini 2.5 Flash + Image Generator)")
+    logger.info("🤖 Bot started successfully (Gemini 2.5 Flash + Image Generator + Chess)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # ========================================
